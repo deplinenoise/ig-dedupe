@@ -80,9 +80,8 @@ Three example data files are provided:
 Future Improvements
 -------------------
 
-After each scoring pass it should be possible to run multiple de-duplication
-moves as long as none of the buckets are overlapping. This will cut down on
-computation time, but could alter results slightly.
+The host parts (combination generator and scoring) could be done in a
+double-buffered fashion to avoid stalling the GPU. 
 
 License
 -------

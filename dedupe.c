@@ -55,7 +55,7 @@ const struct dedupe_options dedupe_defaults =
   1024,       /* max_iterations */
   25,         /* max_bucket_splits */
   1,          /* merge_across_levels */
-  1           /* verbosity */
+  0           /* verbosity */
 };
 
 /*--------------------------------------------------------------------------*/
@@ -71,7 +71,8 @@ const struct dedupe_options dedupe_defaults =
 enum
 {
   MAX_COMBINATIONS    = 6,
-  MAX_PASSES          = MAX_COMBINATIONS - 1 /* 2, 3, 4, ..., MAX_COMBINATIONS */
+  MAX_PASSES          = MAX_COMBINATIONS - 1, /* 2, 3, 4, ..., MAX_COMBINATIONS */
+  NUM_CHOICES         = 16 
 };
 
 /*--------------------------------------------------------------------------*/
@@ -680,7 +681,12 @@ alloc_bucket(struct dedupe_state *state, const char *name, struct bucket_info **
 
 /*--------------------------------------------------------------------------*/
 
-static int deduplicate(struct dedupe_state *state, const cl_int* buckets, int bucket_count, int level) 
+static int deduplicate(
+    struct dedupe_state *state,
+    const cl_int* buckets,
+    int bucket_count,
+    int level,
+    int64_t* savings_out) 
 {
   int b;
   const uint32_t word_count = state->word_count;
@@ -692,6 +698,7 @@ static int deduplicate(struct dedupe_state *state, const cl_int* buckets, int bu
   size_t slen;
   uint32_t ref_count = 0;
   int64_t ref_size = 0;
+  int64_t savings = 0;
 
   memset(scratch, 0xff, table_size);
 
@@ -774,6 +781,23 @@ static int deduplicate(struct dedupe_state *state, const cl_int* buckets, int bu
 
   /* Copy ref bits to our new bucket */
   memcpy(output, scratch, table_size);
+
+  savings = (bucket_count - 1) * ref_size;
+  *savings_out = savings;
+
+  if (state->options.verbosity > 0)
+  {
+    int i;
+
+    printf("  move %9.2f MB -> bucket %5d from (",
+        savings / (1024.0 * 1024.0), (int) (new_bucket - state->buckets));
+
+    for (i = 0; i < bucket_count; ++i)
+    {
+      printf("%s%d", i > 0 ? "/" : "", buckets[i]);
+    }
+    printf(")\n");
+  }
 
   return 0;
 }
@@ -865,6 +889,63 @@ error:
 
 /*--------------------------------------------------------------------------*/
 
+struct comb_score
+{
+  int64_t score;
+  int32_t k;
+  int32_t comb[MAX_COMBINATIONS];
+};
+
+/*--------------------------------------------------------------------------*/
+
+static void track_best_combinations(
+    struct comb_score   *state,
+    int                 state_max,
+    int                 k,
+    int                 count,
+    const uint32_t      *raw_scores,
+    const int32_t       *src_combs)
+{
+  int i;
+  int64_t savings_factor = k - 1;
+
+  for (i = 0; i < count; ++i)
+  {
+    int x;
+    int insert_pos = -1;
+
+    int64_t val = raw_scores[i] * savings_factor;
+
+    for (x = state_max - 1; x >= 0; --x)
+    {
+      if (val >= state[x].score)
+        insert_pos = x;
+      else
+        break;
+    }
+
+    if (insert_pos >= 0)
+    {
+      int move_len = state_max - insert_pos - 1;
+
+      if (move_len)
+      {
+        memmove(state + insert_pos + 1, state + insert_pos, move_len * sizeof(struct comb_score));
+      }
+
+      state[insert_pos].score = val;
+      state[insert_pos].k = k;
+      memcpy(state[insert_pos].comb, src_combs, k * sizeof(int32_t));
+    }
+
+    src_combs += k;
+  }
+
+}
+
+
+/*--------------------------------------------------------------------------*/
+
 static int
 step_deduplication(
     struct dedupe_state *state,
@@ -872,12 +953,9 @@ step_deduplication(
     int bucket_count,
     const int32_t* in_buckets,
     cl_int best_combination[MAX_COMBINATIONS],
-    uint64_t *best_score_out,
-    int* best_k_out)
+    struct comb_score best[NUM_CHOICES])
 {
-  uint64_t best_score = 0;
   int pass, pass_count;
-  int best_K = 0;
   int kick_size = state->options.kick_size;
   cl_command_queue cq = state->ocl_queue;
   cl_int error;
@@ -905,7 +983,6 @@ step_deduplication(
     // Generate runs of combinations.
     for (;;)
     {
-      int x;
       int valid_combinations = combgen_iterate(&gen, state->host_combinations, kick_size, in_buckets);
 
       /* Pad global work size to an even multiple of the local work size. */
@@ -930,40 +1007,27 @@ step_deduplication(
       error = clEnqueueReadBuffer(cq, state->device_output, CL_TRUE, 0, kick_size * sizeof(cl_uint), state->host_scores, 0, NULL, NULL);
       ERRCHECK_GOTO(error, "couldn't read results back", error);
 
-      // Select the best result, store that combination.
-      for (x = 0; x < valid_combinations; ++x)
-      {
-        uint64_t savings = state->host_scores[x] * (K - 1);
-
-        if (savings > best_score)
-        {
-          int i;
-          best_K = K;
-          best_score = savings;
-
-          for (i = 0; i < K; ++i)
-          {
-            best_combination[i] = state->host_combinations[x * K + i];
-          }
-        }
-      }
+      track_best_combinations(best, NUM_CHOICES, K, valid_combinations, state->host_scores, state->host_combinations);
     }
   }
 
-  if (state->options.verbosity > 0 && best_K > 0)
+  if (state->options.verbosity > 2)
   {
-    int i;
+    int i, b;
 
-    printf("best score: kn-%4d/%2d - %9.2f MB (", bucket_count, best_K, best_score / (1024.0 * 1024.0));
-    for (i = 0; i < best_K; ++i)
+    for (b = 0; b < NUM_CHOICES; ++b)
     {
-      printf("%s%d", i > 0 ? "/" : "", best_combination[i]);
+      printf("best score(%3d): kn-%4d/%2d - %9.2f MB (",
+          b + 1, bucket_count, best[b].k, best[b].score / (1024.0 * 1024.0));
+
+      for (i = 0; i < best[b].k; ++i)
+      {
+        printf("%s%d", i > 0 ? "/" : "", best[b].comb[i]);
+      }
+      printf(")\n");
     }
-    printf(")\n");
   }
 
-  *best_k_out = best_K;
-  *best_score_out = best_score;
   return 0;
 
 error:
@@ -1012,7 +1076,11 @@ dedupe_run(struct dedupe_state *state)
 {
   int level, max_levels;
   int iteration, max_iter;
-  uint64_t min_gain = (uint64_t) (state->options.min_gain_mb * 1024 * 1024);
+  int64_t min_gain = (int64_t) (state->options.min_gain_mb * 1024 * 1024);
+  int64_t total_savings = 0;
+  int32_t* eligible_buckets = NULL;
+  uint8_t* seen_buckets = NULL;
+  int return_code = 1;
 
   max_levels = state->options.max_levels;
 
@@ -1024,51 +1092,99 @@ dedupe_run(struct dedupe_state *state)
 
     /* Allocate space for indices of the buckets that are eligble to take part
      * in an iteration. We allocate the worst case (all buckets). */
-    int32_t* eligible_buckets = malloc(sizeof(int32_t) * pass_bucket_count);
-    if (eligible_buckets == NULL)
-      return 1;
+    eligible_buckets = realloc(eligible_buckets, sizeof(int32_t) * pass_bucket_count);
 
-    printf("de-duplication running, level %d/%d - %d buckets...\n", level + 1, max_levels, pass_bucket_count);
+    /* Allocate space to track which buckets have been part of a de-duplication
+     * already. */
+    seen_buckets = realloc(seen_buckets, pass_bucket_count);
+
+    if (eligible_buckets == NULL || seen_buckets == NULL)
+      goto leave;
+
+    printf("De-duplication running, level %d/%d\n",
+        level + 1, max_levels);
 
     if (0 != setup_buffers(state))
-    {
-      free(eligible_buckets);
-      return 1;
-    }
+      goto leave;
 
     max_iter = state->options.max_iterations;
     for (iteration = 0; iteration < max_iter; ++iteration)
     {
-      uint64_t score;
+      struct comb_score best[NUM_CHOICES];
       int eligible_count;
+      int i;
       cl_int combination[MAX_COMBINATIONS];
-      int k;
 
+      /* Reset best scores */
+      memset(best, 0, sizeof best);
+      
+      /* Reset array of seen buckets */
+      memset(seen_buckets, 0, pass_bucket_count);
+ 
+      /* Find the set of buckets that we can de-duplicate from this iteration */
       eligible_count = find_eligible_buckets(state, eligible_buckets, pass_bucket_count, level);
 
-      if (0 != step_deduplication(state, pass_bucket_count, eligible_count, eligible_buckets, combination, &score, &k))
+      if (state->options.verbosity > 0)
       {
-        free(eligible_buckets);
-        return 1;
+        printf(" Stepping solver with %d eligible buckets; %.2f MB saved so far\n",
+            eligible_count, total_savings / (1024.0 * 1024.0));
       }
 
-      if (score < min_gain)
+      /* Come up with the best NUM_CHOICES choices */
+      if (0 != step_deduplication(state, pass_bucket_count, eligible_count, eligible_buckets, combination, best))
+        goto leave;
+
+      /* Perform de-duplication based on choices if possible */
+      for (i = 0; i < NUM_CHOICES; ++i)
       {
-        printf("aborting after %d iterations, gain lower than threshold\n", iteration + 1);
+        int x, seen;
+        int64_t savings;
+
+        if (best[i].score < min_gain)
+          break;
+
+        seen = 0;
+
+        for (x = 0; x < best[i].k; ++x)
+        {
+          int bucket = best[i].comb[x];
+          seen |= seen_buckets[bucket];
+        }
+
+        if (seen)
+          continue; /* buckets involved are already touched */
+
+        if (0 != deduplicate(state, best[i].comb, best[i].k, level, &savings))
+          goto leave;
+
+        total_savings += savings;
+
+        /* Flag these buckets as used */
+        for (x = 0; x < best[i].k; ++x)
+        {
+          int bucket = best[i].comb[x];
+          seen_buckets[bucket] = 1;
+        }
+      }
+
+      if (0 == i)
+      {
+        if (state->options.verbosity > 0)
+          printf("(aborting after %d iterations, gain lower than threshold)\n", iteration + 1);
         break;
       }
-
-      if (0 != deduplicate(state, combination, k, level))
-      {
-        free(eligible_buckets);
-        return 1;
-      }
     }
-
-    free(eligible_buckets);
   }
 
-  return 0;
+  /* Ok */
+  return_code = 0;
+
+leave:
+  free(eligible_buckets);
+  free(seen_buckets);
+
+  return return_code;
+
 }
 
 /*--------------------------------------------------------------------------*/
@@ -1155,7 +1271,7 @@ dedupe_save_output(
 static double
 compute_total_size(struct dedupe_state *state)
 {
-  uint64_t sum = 0;
+  int64_t sum = 0;
   uint32_t i, count;
 
   for (i = 0, count = state->bucket_count; i < count; ++i)
@@ -1171,12 +1287,12 @@ compute_total_size(struct dedupe_state *state)
 void
 dedupe_print_summary(struct dedupe_state *state, const char* label)
 {
-  printf("De-duplication %s summary:\n", label);
+  printf("\nDe-duplication %s summary:\n", label);
 
   printf("  Number of buckets: %9d\n", state->bucket_count);
   printf("  Number of items:   %9d     (32-bit state words: %u)\n", state->item_count, state->word_count);
 
-  printf("  Total data size:   %9.2f MB\n", compute_total_size(state));
+  printf("  Total data size:   %9.2f MB\n\n", compute_total_size(state));
 }
 
 /*--------------------------------------------------------------------------*/

@@ -138,15 +138,13 @@ int main(int argc, char* argv[])
   if (0 != dedupe_load_input(d, in_fn))
     return 1;
 
-  if (options.verbosity > 0)
-    dedupe_print_summary(d, "input");
+  dedupe_print_summary(d, "input");
 
   result = dedupe_run(d);
 
   if (0 == result)
   {
-    if (options.verbosity > 0)
-      dedupe_print_summary(d, "output");
+    dedupe_print_summary(d, "output");
 
     if (options.verbosity > 1)
       dedupe_print_seek_summary(d);
