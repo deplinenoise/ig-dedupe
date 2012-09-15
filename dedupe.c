@@ -341,7 +341,21 @@ dedupe_clear(struct dedupe_state *state)
 void
 dedupe_destroy(struct dedupe_state* state)
 {
+  int i;
+
   dedupe_clear(state);
+
+  for (i = 0; i < state->pass_count; ++i)
+  {
+    if (state->passes[i].kernel)
+      clReleaseKernel(state->passes[i].kernel);
+    if (state->passes[i].program)
+      clReleaseProgram(state->passes[i].program);
+  }
+
+  if (state->ocl_context) clReleaseContext(state->ocl_context);
+  if (state->ocl_queue) clReleaseCommandQueue(state->ocl_queue);
+
   free(state);
 }
 
