@@ -1011,6 +1011,10 @@ step_deduplication(
     }
   }
 
+  /* Flush the queue in case we exited without doing anything */
+  error = clFinish(cq);
+  ERRCHECK_GOTO(error, "couldn't finish command queue", error);
+
   if (state->options.verbosity > 2)
   {
     int i, b;
